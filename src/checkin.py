@@ -114,11 +114,16 @@ def run_checkin():
             ],
         }
 
-        if os.path.exists(CHROME_PATH):
+        # CI 环境（如 GitHub Actions）或无显式配置时，直接用 Playwright Chromium
+        in_ci = os.environ.get("CI", "").lower() in ("1", "true", "yes")
+        if CHROME_PATH and os.path.exists(CHROME_PATH) and not in_ci:
             logger.info(f"使用本机 Chrome: {CHROME_PATH}")
             browser = p.chromium.launch(executable_path=CHROME_PATH, **browser_kwargs)
         else:
-            logger.info("未找到本机 Chrome，使用 Playwright 自带 Chromium")
+            if in_ci:
+                logger.info("CI 环境，使用 Playwright 自带 Chromium")
+            else:
+                logger.info("使用 Playwright 自带 Chromium")
             browser = p.chromium.launch(**browser_kwargs)
 
         context = browser.new_context(
