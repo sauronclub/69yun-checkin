@@ -1,0 +1,56 @@
+name: 69yun Daily Checkin
+
+on:
+  schedule:
+    # 每天北京时间 09:00 运行（UTC 01:00）
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HEADLESS: "true"
+      YUN_EMAIL: ${{ secrets.YUN_EMAIL }}
+      YUN_PASSWORD: ${{ secrets.YUN_PASSWORD }}
+      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run checkin
+        run: python main.py
+
+      - name: Upload logs and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            logs/
+            screenshots/
+          retention-days: 7
