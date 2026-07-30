@@ -42,8 +42,14 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      - name: Run checkin
-        run: python main.py
+      # 添加自动重试，应对偶发性失败
+      - name: Run checkin (with retry)
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 5          # 单次运行超时时间
+          max_attempts: 3             # 最大尝试次数（含首次）
+          retry_wait_seconds: 30      # 重试间隔（秒）
+          command: python main.py
 
       - name: Upload logs and screenshots
         if: always()
