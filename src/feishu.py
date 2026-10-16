@@ -1,141 +1,128 @@
-import sys
-import os
+"""飞书群机器人通知。"""
+
 import json
 import logging
+import os
+import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import requests
 
 import config
 
 logger = logging.getLogger(__name__)
 
-FEISHU_WEBHOOK_URL = config.FEISHU_WEBHOOK_URL
-
 
 def send_message(title: str, content: str) -> dict:
-    """通过飞书群机器人发送文本消息。
-
-    Args:
-        title: 消息标题。
-        content: 消息正文。
+    """发送文本消息到飞书群机器人。
 
     Returns:
         {"success": bool, "status_code": int, "response": str}
     """
     result = {"success": False, "status_code": None, "response": ""}
+    webhook = config.FEISHU_WEBHOOK_URL
 
-    if not FEISHU_WEBHOOK_URL:
+    if not webhook:
         result["response"] = "未配置 FEISHU_WEBHOOK_URL，跳过通知"
         logger.warning(result["response"])
         return result
 
-    payload = {
-        "msg_type": "text",
-        "content": {
-            "text": f"{title}\n\n{content}",
-        },
-    }
+    payload = {"msg_type": "text", "content": {"text": f"{title}\n\n{content}"}}
 
     try:
-        response = requests.post(
-            FEISHU_WEBHOOK_URL,
+        resp = requests.post(
+            webhook,
             headers={"Content-Type": "application/json"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             timeout=15,
         )
-        result["status_code"] = response.status_code
-        result["response"] = response.text
-        if response.status_code == 200:
+        result["status_code"] = resp.status_code
+        result["response"] = resp.text
+        if resp.status_code == 200:
             result["success"] = True
             logger.info("飞书通知发送成功")
         else:
-            logger.warning(f"飞书通知发送失败 [{response.status_code}]: {response.text}")
+            logger.warning(f"飞书通知失败 [{resp.status_code}]: {resp.text}")
     except Exception as e:
         result["response"] = str(e)
-        logger.exception("飞书通知发送异常")
+        logger.exception("飞书通知异常")
 
     return result
 
 
-def _read_tail(path: str, lines: int = 30) -> str:
-    """读取文件末尾指定行数，失败返回空字符串。"""
-    if not path or not os.path.exists(path):
-        return ""
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            all_lines = f.readlines()
-            return "".join(all_lines[-lines:])
-    except Exception as e:
-        return f"读取日志失败: {e}"
+# 签到状态 -> 中文说明
+STATUS_TEXT = {
+    "success": "签到成功",
+    "already": "今日已签到",
+    "failed": "签到失败",
+    "session_lost": "会话失效",
+    "not_found": "未找到签到入口",
+    "unknown": "未知",
+}
 
 
-def notify_checkin_result(checkin_result: dict) -> dict:
+def notify_checkin_result(result: dict) -> dict:
     """根据签到结果构造并发送飞书通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    success = checkin_result.get("success", False)
-    login_success = checkin_result.get("login_success", False)
-    checkin_status = checkin_result.get("checkin_status", "unknown")
-    message = checkin_result.get("message", "")
+    success = result.get("success", False)
+    status = result.get("checkin_status", "unknown")
+    message = result.get("message", "")
+    traffic = result.get("traffic", "")
+    account = result.get("account", {}) or {}
 
-    # 标题
     if not success:
         title = "❌ 69云签到 - 执行失败"
-    elif checkin_status == "already":
+    elif status == "already":
         title = "✅ 69云签到 - 今日已签到"
-    elif checkin_status == "clicked":
-        title = "✅ 69云签到 - 签到成功"
     else:
-        title = "⚠️ 69云签到 - 签到状态未知"
-
-    # 正文
-    status_map = {
-        "already": "今日已签到",
-        "clicked": "签到成功",
-        "not_found": "未找到签到按钮",
-        "unknown": "未知",
-    }
+        title = "✅ 69云签到 - 签到成功"
 
     lines = [
         f"时间：{now}",
-        f"登录：{'成功' if login_success else '失败'}",
-        f"签到：{status_map.get(checkin_status, checkin_status)}",
+        f"登录：{'成功' if result.get('login_success') else '失败'}",
+        f"签到：{STATUS_TEXT.get(status, status)}",
     ]
+    if traffic:
+        lines.append(f"获得流量：{traffic}")
     if message:
         lines.append(f"消息：{message}")
 
-    content = "\n".join(lines)
+    # 账户概况（有就带上，方便一眼看到剩余流量）
+    if account:
+        bits = []
+        if account.get("traffic_remain"):
+            bits.append(f"剩余 {account['traffic_remain']}")
+        if account.get("traffic_used"):
+            bits.append(f"已用 {account['traffic_used']}")
+        if account.get("expire"):
+            bits.append(f"到期 {account['expire']}")
+        if account.get("level"):
+            bits.append(account["level"])
+        if bits:
+            lines.append("账户：" + " / ".join(bits))
 
-    # 失败时追加错误日志末尾内容，方便排查
-    if not success:
-        run_log = checkin_result.get("run_log")
-        if run_log:
-            tail = _read_tail(run_log, lines=30)
-            if tail:
-                # 对日志做简单脱敏：去掉可能出现在 URL 后的查询参数
-                content += "\n\n----- 最近日志 -----\n" + tail
-
-    return send_message(title, content)
+    return send_message(title, "\n".join(lines))
 
 
 if __name__ == "__main__":
-    # 本地快速测试：成功-已签到
-    test_result = {
-        "success": True,
-        "login_success": True,
-        "checkin_status": "already",
-        "message": "今日已签到，无需重复点击",
-    }
-    print("已签到:", notify_checkin_result(test_result))
-
-    # 本地快速测试：失败
-    test_result2 = {
-        "success": False,
-        "login_success": False,
-        "checkin_status": "unknown",
-        "message": "登录超时",
-        "run_log": "",
-    }
-    print("失败:", notify_checkin_result(test_result2))
+    logging.basicConfig(level=logging.INFO)
+    print(
+        notify_checkin_result(
+            {
+                "success": True,
+                "login_success": True,
+                "checkin_status": "success",
+                "message": "尊贵的王者Lv7，您获得了 2.985GB 流量.",
+                "traffic": "2.985GB",
+                "account": {
+                    "traffic_remain": "330.31GB",
+                    "traffic_used": "93.54GB",
+                    "expire": "2053-06-25",
+                    "level": "王者Lv7",
+                },
+            }
+        )
+    )

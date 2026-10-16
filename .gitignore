@@ -1,0 +1,12 @@
+# 环境变量与本地配置（含密码，禁止提交）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 旧版 Playwright 遗留目录
+logs/
+screenshots/

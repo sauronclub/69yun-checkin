@@ -1,307 +1,307 @@
-import os
-import sys
-import json
+"""
+69云（Metron / V2Board 面板）自动签到核心逻辑。
+
+设计要点
+--------
+1. 纯 HTTP 实现，不依赖浏览器。实测该面板的签到就是两个 XHR：
+       POST {base}/auth/login      参数 email / passwd
+       POST {base}/user/checkin    无参数，靠 Cookie 里的会话
+   原先用 Playwright 模拟点击，页面一改版选择器就全失效，且 CI 里要装
+   几百 MB 浏览器；这里直接打接口，快且稳。
+
+2. 返回码语义（已实测）：
+       ret == 1  签到成功，msg 里带本次获得的流量
+       ret == 0  今日已签到过，不算失败
+       其他      异常，msg 会说明原因
+
+3. 任何异常都不打印账号密码；日志里的 URL 统一去掉查询串。
+"""
+
 import logging
+import re
+import time
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from playwright.sync_api import sync_playwright, Request, Response
+import requests
 
 import config
 
-# -------------------- 配置 --------------------
-LOGIN_URL = config.LOGIN_URL or "https://china_69yun.337979.xyz/uuid/auth/login"
-EMAIL = config.YUN_EMAIL
-PASSWORD = config.YUN_PASSWORD
-HEADLESS = os.environ.get("HEADLESS", "false").lower() in ("1", "true", "yes")
-CHROME_PATH = os.environ.get("CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-
-# 项目根目录
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
-SCREENSHOT_DIR = os.path.join(PROJECT_ROOT, "screenshots")
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-NETWORK_LOG = os.path.join(LOG_DIR, f"network_{RUN_ID}.log")
-RUN_LOG = os.path.join(LOG_DIR, f"run_{RUN_ID}.log")
-
-# 模块日志：只添加文件处理器，控制台输出交给 root logger（main.py 配置）
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-file_handler = logging.FileHandler(RUN_LOG, encoding="utf-8")
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+# 面板返回给浏览器的标识，缺失时部分站点会判定为非法请求
+AJAX_HEADERS = {
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Origin": "https://" + config.BASE_URL.split("//")[-1].split("/")[0],
+}
 
-
-def _safe_url(url: str) -> str:
-    """去除 URL 中的查询参数，避免日志泄露 token 等敏感信息。"""
-    try:
-        from urllib.parse import urlsplit, urlunsplit
-        parts = urlsplit(url)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
-    except Exception:
-        return url
+# 常见的 2FA / 验证相关提示，用于更友好地报错
+TWO_FA_HINTS = ("2fa", "两步", "二步", "动态码", "google", "totp", "验证器")
 
 
-def log_network(req: Request, res: Response = None, tag: str = ""):
-    """将请求/响应关键信息写入网络日志。"""
-    data = {
-        "time": datetime.now().isoformat(),
-        "tag": tag,
-        "url": _safe_url(req.url),
-        "method": req.method,
-        "resource_type": req.resource_type,
+def _clean(msg) -> str:
+    """把接口返回的 msg 压成一行，去掉活动广告等噪音换行。"""
+    if msg is None:
+        return ""
+    text = str(msg).strip()
+    # 保留首段（真正的结果），丢弃后面追加的活动文案
+    text = text.split("\n\n")[0].strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def _looks_like_two_fa(msg: str) -> bool:
+    low = msg.lower()
+    return any(h in low for h in TWO_FA_HINTS)
+
+
+def _parse_traffic(msg: str) -> str:
+    """从签到成功文案里抠出流量数值，例如「您获得了 2.985GB 流量」。"""
+    m = re.search(r"([\d.]+\s*(?:[KMGTP]?B|字节|流量))", msg, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _parse_account(html: str) -> dict:
+    """从用户中心 HTML 里提取账户概况（仅用于通知展示，失败不影响签到）。"""
+    info = {}
+    text = re.sub(r"<script.*?</script>", " ", html, flags=re.S)
+    text = re.sub(r"<style.*?</style>", " ", text, flags=re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    patterns = {
+        "level": r"(?:会员时长|等级)\s*(?:时长)?\s*[:：]?\s*([\u4e00-\u9fa5A-Za-z]{1,6}\s*Lv\s*\d+)",
+        "expire": r"(\d{4}-\d{2}-\d{2})\s*(?:到期|过期)",
+        "traffic_remain": r"([\d.]+\s*[GMK]B)\s*剩余流量",
+        "traffic_used": r"已用流量[：:]\s*([\d.]+\s*[GMK]B)",
+        "devices": r"(\d+)\s*/\s*\d+\s*在线设备",
     }
-    if res:
-        data["status"] = res.status
-        data["status_text"] = res.status_text
+    for key, pat in patterns.items():
+        m = re.search(pat, text)
+        if m:
+            info[key] = m.group(1).strip()
+
+    # 等级单独兜底：面板文案形如「王者Lv7」
+    if "level" not in info:
+        m = re.search(r"([\u4e00-\u9fa5A-Za-z]{1,6}\s*Lv\s*\d+)", text)
+        if m:
+            info["level"] = m.group(1).strip()
+    return info
+
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": config.USER_AGENT})
+    if not config.VERIFY_SSL:
+        # 本机若走了代理导致证书主机名不匹配，可设 VERIFY_SSL=false 临时绕过
+        s.verify = False
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    return s
+
+
+def _request_with_retry(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    desc: str,
+    **kwargs,
+) -> requests.Response:
+    """带指数退避的请求。5xx 和网络抖动才重试，4xx 直接抛。"""
+    last_err = None
+    for attempt in range(1, config.REQUEST_RETRY + 1):
         try:
-            data["content_type"] = res.headers.get("content-type", "")
-        except Exception:
-            pass
+            resp = session.request(method, url, timeout=config.REQUEST_TIMEOUT, **kwargs)
+            if resp.status_code >= 500 and attempt < config.REQUEST_RETRY:
+                wait = config.RETRY_BACKOFF * (2 ** (attempt - 1))
+                logger.warning(
+                    f"{desc} 返回 {resp.status_code}，{wait}s 后重试 ({attempt}/{config.REQUEST_RETRY})"
+                )
+                time.sleep(wait)
+                continue
+            return resp
+        except requests.RequestException as e:
+            last_err = e
+            if attempt < config.REQUEST_RETRY:
+                wait = config.RETRY_BACKOFF * (2 ** (attempt - 1))
+                logger.warning(f"{desc} 失败: {e}，{wait}s 后重试 ({attempt}/{config.REQUEST_RETRY})")
+                time.sleep(wait)
+            else:
+                break
+    raise RuntimeError(f"{desc} 请求失败: {last_err}")
 
-    with open(NETWORK_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+def _json_of(resp: requests.Response, desc: str) -> dict:
+    """解析 JSON 响应，失败时抛出可读异常。"""
+    try:
+        return resp.json()
+    except ValueError:
+        snippet = resp.text[:200].replace("\n", " ")
+        raise RuntimeError(f"{desc} 返回非 JSON (HTTP {resp.status_code}): {snippet}")
 
 
-def flush_logs():
-    """强制刷新日志处理器到磁盘，避免异常退出时丢失日志。"""
-    for handler in logger.handlers:
-        handler.flush()
-        if hasattr(handler, "stream") and hasattr(handler.stream, "fileno"):
-            try:
-                os.fsync(handler.stream.fileno())
-            except Exception:
-                pass
+def login(session: requests.Session) -> dict:
+    """登录并建立会话 Cookie。"""
+    # 先 GET 一次登录页，让服务端种下会话/风控 cookie
+    _request_with_retry(session, "GET", config.LOGIN_URL, desc="预热登录页")
+
+    resp = _request_with_retry(
+        session,
+        "POST",
+        config.LOGIN_URL,
+        desc="登录",
+        headers={**AJAX_HEADERS, "Referer": config.LOGIN_URL},
+        data={"email": config.YUN_EMAIL, "passwd": config.YUN_PASSWORD, "remember": "1"},
+        allow_redirects=False,
+    )
+    data = _json_of(resp, "登录")
+    msg = _clean(data.get("msg", ""))
+
+    if data.get("ret") == 1:
+        # 会话 cookie 是签到凭证，确认一下真的种上了
+        names = {c.name for c in session.cookies}
+        logger.info(f"登录成功，会话 cookie: {sorted(names)}")
+        return {"success": True, "message": msg}
+    if _looks_like_two_fa(msg):
+        return {
+            "success": False,
+            "message": "账号开启了两步验证，接口登录被拒。需在 YUN_2FA_CODE 配置当前动态码，"
+            "或先关闭面板的 2FA 后重试",
+        }
+    return {"success": False, "message": msg or "登录失败"}
 
 
-def run_checkin():
-    """执行签到流程，返回结果字典供 main.py 使用。"""
+def do_checkin(session: requests.Session) -> dict:
+    """调用签到接口。"""
+    resp = _request_with_retry(
+        session,
+        "POST",
+        config.CHECKIN_URL,
+        desc="签到",
+        headers={**AJAX_HEADERS, "Referer": config.USER_URL},
+        data={},
+        allow_redirects=False,
+    )
+    # 未登录时面板会 302 到登录页
+    if resp.status_code in (301, 302, 303, 307, 308):
+        return {"success": False, "status": "session_lost", "message": "会话已失效，请重试"}
+    if resp.status_code == 401:
+        return {"success": False, "status": "session_lost", "message": "未授权，会话已失效"}
+
+    data = _json_of(resp, "签到")
+    raw_msg = data.get("msg", "")
+    msg = _clean(raw_msg)
+    ret = data.get("ret")
+
+    if ret == 1:
+        logger.info(f"签到成功: {msg}")
+        return {
+            "success": True,
+            "status": "success",
+            "message": msg,
+            "traffic": _parse_traffic(raw_msg),
+        }
+    if ret == 0:
+        # 「您似乎已经签到过了」——今天已完成，视为正常
+        logger.info(f"今日已签到: {msg}")
+        return {"success": True, "status": "already", "message": msg or "今日已签到"}
+    return {"success": False, "status": "failed", "message": msg or f"未知返回 ret={ret}"}
+
+
+def fetch_account(session: requests.Session) -> dict:
+    """读取账户概况，失败不影响主流程。"""
+    try:
+        resp = _request_with_retry(session, "GET", config.USER_URL, desc="账户信息")
+        if resp.status_code != 200:
+            return {}
+        return _parse_account(resp.text)
+    except Exception as e:
+        logger.warning(f"读取账户信息失败（不影响签到）: {e}")
+        return {}
+
+
+def run_checkin() -> dict:
+    """完整流程：登录 → 签到 → 读取账户。返回结果字典。"""
     result = {
         "success": False,
         "login_success": False,
         "checkin_status": "unknown",
         "message": "",
-        "current_url": "",
-        "screenshots": [],
-        "network_log": NETWORK_LOG,
-        "run_log": RUN_LOG,
+        "account": {},
     }
 
     logger.info("=" * 50)
-    logger.info("开始 69 云签到流程")
-    logger.info(f"登录地址: {LOGIN_URL}")
-    logger.info(f"有头模式: {not HEADLESS}")
-    logger.info(f"网络日志: {NETWORK_LOG}")
-    flush_logs()
+    logger.info("69云签到开始（纯 HTTP 模式）")
+    logger.info(f"站点: {config.BASE_URL}")
+    logger.info(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("-" * 50)
 
-    if not EMAIL or not PASSWORD:
-        result["message"] = "缺少邮箱或密码，请检查 .env 或环境变量"
+    if not config.YUN_EMAIL or not config.YUN_PASSWORD:
+        result["message"] = "缺少 YUN_EMAIL 或 YUN_PASSWORD，请检查 GitHub Secrets"
         logger.error(result["message"])
         return result
 
-    with sync_playwright() as p:
-        browser_kwargs = {
-            "headless": HEADLESS,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        }
+    session = _make_session()
 
-        # CI 环境（如 GitHub Actions）或无显式配置时，直接用 Playwright Chromium
-        in_ci = os.environ.get("CI", "").lower() in ("1", "true", "yes")
-        if CHROME_PATH and os.path.exists(CHROME_PATH) and not in_ci:
-            logger.info(f"使用本机 Chrome: {CHROME_PATH}")
-            browser = p.chromium.launch(executable_path=CHROME_PATH, **browser_kwargs)
-        else:
-            if in_ci:
-                logger.info("CI 环境，使用 Playwright 自带 Chromium")
-            else:
-                logger.info("使用 Playwright 自带 Chromium")
-            browser = p.chromium.launch(**browser_kwargs)
+    # 1) 登录
+    try:
+        login_res = login(session)
+    except Exception as e:
+        result["message"] = f"登录异常: {e}"
+        logger.error(result["message"])
+        return result
 
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            ),
-        )
+    result["login_success"] = login_res["success"]
+    if not login_res["success"]:
+        result["message"] = f"登录失败: {login_res['message']}"
+        logger.error(result["message"])
+        return result
 
-        page = context.new_page()
+    # 2) 签到
+    try:
+        checkin_res = do_checkin(session)
+    except Exception as e:
+        result["message"] = f"签到异常: {e}"
+        logger.error(result["message"])
+        return result
 
-        def on_request(req: Request):
-            log_network(req, tag="request")
+    result["checkin_status"] = checkin_res["status"]
+    result["success"] = checkin_res["success"]
+    result["message"] = checkin_res["message"]
+    if checkin_res.get("traffic"):
+        result["traffic"] = checkin_res["traffic"]
+        logger.info(f"本次获得流量: {checkin_res['traffic']}")
 
-        def on_response(res: Response):
-            log_network(res.request, res=res, tag="response")
-            if "/auth/login" in res.url and res.request.method == "POST":
-                try:
-                    body = res.body()
-                    text = body.decode("utf-8", errors="ignore")[:2000]
-                    logger.info(f"登录接口响应 [{res.status}] URL={_safe_url(res.url)}: {text}")
-                    flush_logs()
-                except Exception as e:
-                    logger.warning(f"读取登录响应失败: {e}")
-            if "/user/authcode" in res.url and res.request.method == "POST":
-                try:
-                    body = res.body()
-                    text = body.decode("utf-8", errors="ignore")[:2000]
-                    logger.info(f"authcode 接口响应 [{res.status}] URL={_safe_url(res.url)}: {text}")
-                    flush_logs()
-                except Exception as e:
-                    logger.warning(f"读取 authcode 响应失败: {e}")
-
-        page.on("request", on_request)
-        page.on("response", on_response)
-
+    # 会话失效时重登一次再试（应对 token 过期）
+    if checkin_res["status"] == "session_lost":
+        logger.info("会话失效，重新登录后再试一次")
         try:
-            # 1. 访问登录页
-            logger.info("正在打开登录页面...")
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_selector('input[name="email"], input[type="email"], #email', timeout=15000)
-            page.wait_for_timeout(1500)
-            shot1 = os.path.join(SCREENSHOT_DIR, f"01_login_{RUN_ID}.png")
-            page.screenshot(path=shot1)
-            result["screenshots"].append(shot1)
-            logger.info("登录页面已加载")
-            flush_logs()
-
-            # 2. 填充表单
-            logger.info("填充用户名/密码...")
-            page.locator('input[name="email"], input[type="email"], #email').first.fill(EMAIL)
-            page.locator('input[name="passwd"], input[type="password"], #passwd, #password').first.fill(PASSWORD)
-
-            try:
-                remember = page.locator('input[name="remember_me"], input[name="remember"]').first
-                if remember.count() > 0:
-                    remember.check(timeout=3000)
-                    logger.info("已勾选 remember_me")
-            except Exception as e:
-                logger.info(f"remember_me 不存在或无需勾选: {e}")
-
-            shot2 = os.path.join(SCREENSHOT_DIR, f"02_filled_{RUN_ID}.png")
-            page.screenshot(path=shot2)
-            result["screenshots"].append(shot2)
-            flush_logs()
-
-            # 3. 点击登录
-            logger.info("点击登录按钮...")
-            login_btn = page.locator(
-                'button[type="submit"], button:has-text("登录"), button:has-text("Login"), '
-                'a:has-text("登录"), input[type="submit"]'
-            ).first
-            login_btn.click(timeout=10000)
-
-            # 4. 等待跳转/页面稳定
-            logger.info("等待登录后页面稳定...")
-            try:
-                page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                logger.info("networkidle 未在 5s 内触发，继续执行（可能是第三方 widget 长连接）")
-            page.wait_for_timeout(2500)
-            result["current_url"] = page.url
-            logger.info(f"当前页面 URL: {result['current_url']}")
-            shot3 = os.path.join(SCREENSHOT_DIR, f"03_after_login_{RUN_ID}.png")
-            page.screenshot(path=shot3)
-            result["screenshots"].append(shot3)
-            flush_logs()
-
-            # 5. 判断登录是否成功
-            if "/user" in result["current_url"] or "/auth/login" not in result["current_url"]:
-                result["login_success"] = True
-                flush_logs()
+            if login(session)["success"]:
+                retry = do_checkin(session)
+                result["checkin_status"] = retry["status"]
+                result["success"] = retry["success"]
+                result["message"] = retry["message"]
+                if retry.get("traffic"):
+                    result["traffic"] = retry["traffic"]
             else:
-                result["message"] = "登录后未跳转到用户页，可能登录失败"
-                logger.warning(result["message"])
-                flush_logs()
-                return result
-
-            # 6. 查找签到按钮
-            checkin_selectors = [
-                'button:has-text("签到")',
-                'a:has-text("签到")',
-                'button:has-text("每日签到")',
-                'a:has-text("每日签到")',
-                'button:has-text("Checkin")',
-                'a:has-text("Checkin")',
-                'button:has-text("Check In")',
-                '[id*="checkin" i]',
-                '[class*="checkin" i]',
-                '[data-action="checkin"]',
-            ]
-
-            checkin_btn = None
-            for selector in checkin_selectors:
-                loc = page.locator(selector).first
-                try:
-                    if loc.count() > 0 and loc.is_visible(timeout=2000):
-                        checkin_btn = loc
-                        logger.info(f"找到签到按钮: {selector}")
-                        break
-                except Exception:
-                    # 当前选择器不可见或已 detached，继续尝试下一个
-                    continue
-
-            if checkin_btn:
-                btn_text = checkin_btn.inner_text(timeout=3000).strip()
-                logger.info(f"按钮文案: {btn_text}")
-                if "已签到" in btn_text:
-                    result["checkin_status"] = "already"
-                    result["message"] = "今日已签到，无需重复点击"
-                    logger.info(result["message"])
-                else:
-                    checkin_btn.click(timeout=10000)
-                    result["checkin_status"] = "clicked"
-                    result["message"] = "已点击签到按钮"
-                    logger.info(result["message"])
-                    page.wait_for_timeout(2000)
-                shot4 = os.path.join(SCREENSHOT_DIR, f"04_checkin_done_{RUN_ID}.png")
-                page.screenshot(path=shot4)
-                result["screenshots"].append(shot4)
-            else:
-                result["checkin_status"] = "not_found"
-                result["message"] = "未找到签到按钮"
-                logger.warning(result["message"])
-
-            result["success"] = True
-
-            # 7. 保存最终页面信息
-            final_info = {
-                "url": page.url,
-                "title": page.title(),
-                "run_id": RUN_ID,
-                "result": result,
-            }
-            info_path = os.path.join(LOG_DIR, f"final_{RUN_ID}.json")
-            with open(info_path, "w", encoding="utf-8") as f:
-                json.dump(final_info, f, ensure_ascii=False, indent=2)
-            logger.info(f"最终页面信息已保存: {info_path}")
-            flush_logs()
-
+                result["message"] = "重新登录失败，会话已失效"
         except Exception as e:
-            logger.exception("运行过程出现错误")
-            result["message"] = f"异常: {str(e)}"
-            try:
-                error_shot = os.path.join(SCREENSHOT_DIR, f"error_{RUN_ID}.png")
-                page.screenshot(path=error_shot)
-                result["screenshots"].append(error_shot)
-            except Exception:
-                pass
-        finally:
-            context.close()
-            browser.close()
+            logger.error(f"重试失败: {e}")
+            result["message"] = f"重试失败: {e}"
 
-    logger.info("流程结束")
+    # 3) 账户概况
+    result["account"] = fetch_account(session)
+    if result["account"]:
+        logger.info(f"账户信息: {result['account']}")
+
+    logger.info("=" * 50)
     return result
 
 
 if __name__ == "__main__":
-    r = run_checkin()
-    print(json.dumps(r, ensure_ascii=False, indent=2))
+    import json
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    print(json.dumps(run_checkin(), ensure_ascii=False, indent=2))

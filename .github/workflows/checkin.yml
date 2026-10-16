@@ -9,11 +9,11 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     env:
-      HEADLESS: "true"
       YUN_EMAIL: ${{ secrets.YUN_EMAIL }}
       YUN_PASSWORD: ${{ secrets.YUN_PASSWORD }}
+      BASE_URL: ${{ vars.BASE_URL }}
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
 
     steps:
@@ -24,39 +24,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
+      # 纯 HTTP 实现，只需 requests，不再安装 Playwright 和 Chromium
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright browsers
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
-
-      # 添加自动重试，应对偶发性失败
-      - name: Run checkin (with retry)
-        uses: nick-fields/retry@v2
-        with:
-          timeout_minutes: 5          # 单次运行超时时间
-          max_attempts: 3             # 最大尝试次数（含首次）
-          retry_wait_seconds: 30      # 重试间隔（秒）
-          command: python main.py
-
-      - name: Upload logs and screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: checkin-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            logs/
-            screenshots/
-          retention-days: 7
+      - name: Run checkin
+        run: python main.py
