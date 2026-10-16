@@ -9,7 +9,15 @@ load_dotenv()
 
 
 def _env(key: str, default: str = "") -> str:
-    return os.environ.get(key, default).strip()
+    """读环境变量。空值或纯空白视为「未设置」，回退到默认值。
+
+    GitHub Actions 里 `${{ vars.X }}` 在变量不存在时会展开成空字符串，
+    直接覆盖默认值会导致 BASE_URL 变空、拼出 `/auth/login` 这种非法 URL。
+    这里统一做兜底。
+    """
+    val = os.environ.get(key, "")
+    val = val.strip() if isinstance(val, str) else val
+    return val if val else default
 
 
 def _flag(key: str, default: bool = False) -> bool:
@@ -29,6 +37,16 @@ def _int(key: str, default: int) -> int:
 # ---- 站点 ----
 # 面板根地址（含 uuid 前缀的那一层，例如 https://xxx.com/uuid）
 BASE_URL = _env("BASE_URL", "https://china_69yun.337979.xyz/uuid").rstrip("/")
+
+# 配置自检：BASE_URL 被配错时立刻给出可读错误，
+# 否则后面会抛出 "Invalid URL: No scheme supplied" 这类难以定位的错。
+if not BASE_URL.startswith(("http://", "https://")):
+    raise ValueError(
+        f"BASE_URL 配置无效: {BASE_URL!r}\n"
+        "应为形如 https://域名/uuid 的完整地址。"
+        "若在 GitHub Actions Variables 中留空，请直接删除该变量而不是留空值。"
+    )
+
 # 登录接口，默认由 BASE_URL 推导
 LOGIN_URL = _env("LOGIN_URL") or f"{BASE_URL}/auth/login"
 # 用户中心，主要用于读取账户信息

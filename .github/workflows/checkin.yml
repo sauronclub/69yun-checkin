@@ -13,7 +13,9 @@ jobs:
     env:
       YUN_EMAIL: ${{ secrets.YUN_EMAIL }}
       YUN_PASSWORD: ${{ secrets.YUN_PASSWORD }}
-      BASE_URL: ${{ vars.BASE_URL }}
+      # 不在这里设 BASE_URL：vars.BASE_URL 未配置时会展开成空字符串。
+      # 留空则由 config.py 使用内置默认值，避免拼出非法 URL。
+      # 若要换站点，请在本仓库 Settings → Variables 新增 BASE_URL。
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
 
     steps:
