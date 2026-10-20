@@ -20,13 +20,21 @@
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 
 import config
 
 logger = logging.getLogger(__name__)
+
+# GitHub Actions 的 runner 是 UTC；日志和通知统一按北京时间显示，
+# 否则 14:33 的任务会显示成 06:33，容易被误判为没按时运行。
+TZ = timezone(timedelta(hours=config.TZ_OFFSET_HOURS))
+
+
+def _now() -> datetime:
+    return datetime.now(TZ)
 
 # 面板返回给浏览器的标识，缺失时部分站点会判定为非法请求
 AJAX_HEADERS = {
@@ -38,6 +46,12 @@ AJAX_HEADERS = {
 
 # 常见的 2FA / 验证相关提示，用于更友好地报错
 TWO_FA_HINTS = ("2fa", "两步", "二步", "动态码", "google", "totp", "验证器")
+
+# 「今日已签到」的提示特征。
+# 必须显式匹配：面板用 abort() 表达所有业务失败，ret 一律为 0，
+# 因此不能把 ret==0 直接当成「已签到」，否则套餐过期、账号被封这类
+# 故障会被误报成成功，脚本静默退出，永远不会告警。
+ALREADY_HINTS = ("已经签到", "已签到", "签到过", "重复签到", "already checked")
 
 
 def _clean(msg) -> str:
@@ -53,6 +67,17 @@ def _clean(msg) -> str:
 def _looks_like_two_fa(msg: str) -> bool:
     low = msg.lower()
     return any(h in low for h in TWO_FA_HINTS)
+
+
+def _looks_like_already(msg: str) -> bool:
+    """判断 ret=0 的提示是否真的是「今日已签到」。
+
+    面板对「已签到」和「套餐过期」这类业务错误都返回 ret=0，
+    只有文案能区分。匹配不到就按失败处理——宁可多报一次失败，
+    也不要把真实故障静默成成功。
+    """
+    low = (msg or "").lower()
+    return any(h in low for h in ALREADY_HINTS)
 
 
 def _parse_traffic(msg: str) -> str:
@@ -109,7 +134,11 @@ def _request_with_retry(
     desc: str,
     **kwargs,
 ) -> requests.Response:
-    """带指数退避的请求。5xx 和网络抖动才重试，4xx 直接抛。"""
+    """带指数退避的请求。
+
+    只有 5xx 和网络异常会重试；4xx 属确定性错误，直接返回给调用方判断。
+    TLS 证书错误不重试（重试无意义），直接抛出带排查指引的异常。
+    """
     last_err = None
     for attempt in range(1, config.REQUEST_RETRY + 1):
         try:
@@ -203,8 +232,9 @@ def login(session: requests.Session) -> dict:
     if _looks_like_two_fa(msg):
         return {
             "success": False,
-            "message": "账号开启了两步验证，接口登录被拒。需在 YUN_2FA_CODE 配置当前动态码，"
-            "或先关闭面板的 2FA 后重试",
+            "message": "账号开启了两步验证，接口登录被拒。"
+            "本项目不支持自动生成动态码，需先在面板关闭 2FA 才能无人值守运行。"
+            f"面板返回: {msg}",
         }
     return {"success": False, "message": msg or "登录失败"}
 
@@ -240,9 +270,17 @@ def do_checkin(session: requests.Session) -> dict:
             "traffic": _parse_traffic(raw_msg),
         }
     if ret == 0:
-        # 「您似乎已经签到过了」——今天已完成，视为正常
-        logger.info(f"今日已签到: {msg}")
-        return {"success": True, "status": "already", "message": msg or "今日已签到"}
+        # ret=0 是面板的通用失败码，「已签到」只是其中一种情况。
+        # 必须看文案区分，否则套餐过期/账号被封会被误报成签到成功。
+        if _looks_like_already(msg):
+            logger.info(f"今日已签到: {msg}")
+            return {"success": True, "status": "already", "message": msg or "今日已签到"}
+        logger.error(f"签到未成功: {msg or '面板返回 ret=0 但未说明原因'}")
+        return {
+            "success": False,
+            "status": "failed",
+            "message": msg or "面板返回 ret=0 但未说明原因，请人工确认账户状态",
+        }
     return {"success": False, "status": "failed", "message": msg or f"未知返回 ret={ret}"}
 
 
@@ -270,8 +308,9 @@ def run_checkin() -> dict:
 
     logger.info("=" * 50)
     logger.info("69云签到开始（纯 HTTP 模式）")
+    config.warn_if_insecure()
     logger.info(f"站点: {config.BASE_URL}")
-    logger.info(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"时间: {_now().strftime('%Y-%m-%d %H:%M:%S')} (UTC+{config.TZ_OFFSET_HOURS})")
     logger.info("-" * 50)
 
     if not config.YUN_EMAIL or not config.YUN_PASSWORD:
