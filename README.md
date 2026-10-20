@@ -38,7 +38,18 @@
 
 | 名称 | 默认值 | 说明 |
 |---|---|---|
-| `BASE_URL` | `https://china_69yun.337979.xyz/uuid` | 面板根地址，换机场时改这里 |
+| `BASE_URL` | `https://ui567u.337979.xyz/uuid` | 面板根地址，换机场时改这里 |
+
+> **注意**：这个默认值请不要改成 `https://china_69yun.337979.xyz/uuid`。
+> 该域名虽然也是面板入口，但其证书只签发了 `*.69yun69.com`，
+> 主机名不匹配会让脚本抛 `SSLError`——浏览器能打开只是因为它对这类错误更宽容。
+>
+> 换域名时可先验证证书是否覆盖该主机名：
+> ```bash
+> echo | openssl s_client -connect 你的域名:443 2>/dev/null \
+>   | openssl x509 -noout -ext subjectAltName
+> ```
+> 输出里的 DNS 列表必须包含你要用的域名。
 
 > 密码只存在 GitHub Secrets 里，不进代码库。
 
@@ -64,8 +75,18 @@ python main.py
 **提示「账号开启了两步验证」**
 面板给账号开了 2FA，接口登录会被拒。需先在面板关闭 2FA；这类场景确实无法用无状态接口自动完成。
 
-**CI 报 SSL 证书错误**
-若 GitHub Actions 侧出现证书问题，可临时设环境变量 `VERIFY_SSL=false`（会关闭证书校验，谨慎使用）。
+**CI 报 `Hostname mismatch` / `certificate verify failed`**
+
+域名和证书不匹配。这不是网络故障，重试也没用。根治办法是**换用证书覆盖该主机的域名**，
+用上面 `openssl s_client` 的方法先验一下。
+
+把 `VERIFY_SSL=false` 当临时手段可以跑通，但会关闭证书校验、降低传输安全性，
+且面板每次换证书都会再坏一次——不建议长期用。
+
+**本地能跑但 CI 失败**
+
+最常见原因就是本地开了 `VERIFY_SSL=false` 而 CI 没开。
+建议本地也保持证书校验开启，用 `openssl s_client` 先确认域名没问题再跑。
 
 **运行时间**
 纯 HTTP 无需下载浏览器，通常 3～5 秒完成。
