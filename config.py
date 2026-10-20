@@ -51,13 +51,19 @@ USER_AGENT = _env(
 # ---- 站点 ----
 # 面板根地址（含 uuid 前缀的那一层）
 #
-# 默认用 china.69yun69.net：这是机场自己标注的「国内免翻墙」入口，
-# 证书 CN 完全匹配，SSL 校验可直接通过。
+# 默认用 ui567u.337979.xyz：这是机场官网上挂的面板入口之一，
+# 证书有效，SSL 校验可直接通过（已在严格校验下验证 HTTP 200）。
 #
-# 不要改回 china_69yun.337979.xyz —— 那个域名的证书只签发了 *.69yun69.com，
-# 主机名不匹配会让 requests 抛 SSLError，GitHub Actions 必然失败。
-# （浏览器能打开是因为它对这类错误更宽容，不代表证书是有效的。）
-BASE_URL = _env("BASE_URL", "https://china.69yun69.net/uuid").rstrip("/")
+# 同一面板还有多个等价入口，证书指纹一致，可互换：
+#   ui567u.337979.xyz / yydeee.337979.xyz
+#
+# 不要用这些：
+#   china_69yun.337979.xyz —— 面板本身，但证书只签发 *.69yun69.com，
+#     主机名不匹配会让 requests 抛 SSLError，GitHub Actions 必然失败
+#     （浏览器能打开只是因为它对这类错误更宽容）
+#   china.69yun69.net / 69yun69.com —— 是官网，不是 API 端点，
+#     请求登录接口会返回 HTML 而非 JSON
+BASE_URL = _env("BASE_URL", "https://ui567u.337979.xyz/uuid").rstrip("/")
 
 # 登录接口，默认由 BASE_URL 推导
 LOGIN_URL = _env("LOGIN_URL") or f"{BASE_URL}/auth/login"
