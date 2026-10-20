@@ -124,6 +124,9 @@ def _request_with_retry(
             return resp
         except requests.RequestException as e:
             last_err = e
+            # 证书问题重试没有意义，重试只会浪费时间
+            if _is_ssl_error(e):
+                raise RuntimeError(_ssl_hint(e)) from e
             if attempt < config.REQUEST_RETRY:
                 wait = config.RETRY_BACKOFF * (2 ** (attempt - 1))
                 logger.warning(f"{desc} 失败: {e}，{wait}s 后重试 ({attempt}/{config.REQUEST_RETRY})")
@@ -131,6 +134,39 @@ def _request_with_retry(
             else:
                 break
     raise RuntimeError(f"{desc} 请求失败: {last_err}")
+
+
+def _is_ssl_error(exc: Exception) -> bool:
+    """判断是否为 TLS 证书类错误。"""
+    text = str(exc).lower()
+    return any(
+        k in text
+        for k in ("ssl", "certificate", "hostname mismatch", "certificate_verify_failed")
+    )
+
+
+def _ssl_hint(exc: Exception) -> str:
+    """针对证书问题给出可照做的排查提示，而不是抛一堆原始堆栈。"""
+    text = str(exc)
+    lines = [
+        "TLS 证书校验失败，已停止重试。",
+        f"当前站点: {config.BASE_URL}",
+        f"原因: {text[:220]}",
+    ]
+    if "hostname mismatch" in text.lower():
+        lines += [
+            "",
+            "这是「域名与证书不匹配」：该域名的证书没有覆盖你正在访问的主机名。",
+            "浏览器往往仍能打开（它对这类错误更宽容），但脚本会严格拒绝。",
+            "解决办法：改用证书有效的域名。本项目默认域名见 config.py 的 BASE_URL 处注释。",
+        ]
+    else:
+        lines += ["请检查域名是否正确、系统时间是否准确。"]
+    lines += [
+        "",
+        "若确认要临时绕过（降低安全性，不推荐长期使用），可设环境变量 VERIFY_SSL=false。",
+    ]
+    return "\n".join(lines)
 
 
 def _json_of(resp: requests.Response, desc: str) -> dict:
