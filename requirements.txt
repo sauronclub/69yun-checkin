@@ -1,2 +1,3 @@
-requests>=2.31.0
-python-dotenv>=1.0.0
+# 锁上限，避免依赖大版本升级后行为突变导致 CI 半夜挂掉
+requests>=2.31.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
