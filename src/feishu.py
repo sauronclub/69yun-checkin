@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -13,6 +13,9 @@ import requests
 import config
 
 logger = logging.getLogger(__name__)
+
+# 与签到日志保持一致，用北京时间而非 runner 的 UTC
+TZ = timezone(timedelta(hours=config.TZ_OFFSET_HOURS))
 
 
 def send_message(title: str, content: str) -> dict:
@@ -58,14 +61,13 @@ STATUS_TEXT = {
     "already": "今日已签到",
     "failed": "签到失败",
     "session_lost": "会话失效",
-    "not_found": "未找到签到入口",
     "unknown": "未知",
 }
 
 
 def notify_checkin_result(result: dict) -> dict:
     """根据签到结果构造并发送飞书通知。"""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     success = result.get("success", False)
     status = result.get("checkin_status", "unknown")
