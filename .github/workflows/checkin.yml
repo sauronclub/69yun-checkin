@@ -10,6 +10,13 @@ jobs:
   checkin:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # 最小权限：只读仓库内容，不需要写任何东西
+    permissions:
+      contents: read
+    # 手动触发与定时任务撞车时，让后到的等待而不是并发签到
+    concurrency:
+      group: 69yun-checkin
+      cancel-in-progress: false
     env:
       YUN_EMAIL: ${{ secrets.YUN_EMAIL }}
       YUN_PASSWORD: ${{ secrets.YUN_PASSWORD }}
