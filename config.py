@@ -79,6 +79,12 @@ YUN_PASSWORD = _env("YUN_PASSWORD")
 # ---- 通知 ----
 FEISHU_WEBHOOK_URL = _env("FEISHU_WEBHOOK_URL")
 
+# ---- 展示 ----
+# 日志和通知里的时间统一用北京时间。
+# GitHub Actions 的 runner 是 UTC，直接用 datetime.now() 会显示成
+# 「06:33」，而实际北京时间是 14:33，容易让人误判任务没在预期时间跑。
+TZ_OFFSET_HOURS = _int("TZ_OFFSET_HOURS", 8)
+
 # ---- 配置自检 ----
 if not BASE_URL.startswith(("http://", "https://")):
     raise ValueError(
@@ -87,10 +93,12 @@ if not BASE_URL.startswith(("http://", "https://")):
         "若在 GitHub Actions Variables 中留空，请直接删除该变量而不是留空值。"
     )
 
-if not VERIFY_SSL and not _flag("ALLOW_INSECURE_SSL", False):
-    # 关闭证书校验是安全降级，仅在明确知情时放行
-    logger.warning("=" * 60)
-    logger.warning("VERIFY_SSL=false：已关闭 TLS 证书校验，传输不再防中间人。")
-    logger.warning("首选做法是改用证书有效的域名（见本文件 BASE_URL 处注释）。")
-    logger.warning("确认要继续可设 ALLOW_INSECURE_SSL=1 消除此提示。")
-    logger.warning("=" * 60)
+# 关闭证书校验时的告警放在 warn_if_insecure() 里，
+# 不在模块导入时输出——那时 logging 还没配置，格式会和主日志错位。
+def warn_if_insecure() -> None:
+    if not VERIFY_SSL and not _flag("ALLOW_INSECURE_SSL", False):
+        logger.warning("=" * 60)
+        logger.warning("VERIFY_SSL=false：已关闭 TLS 证书校验，传输不再防中间人。")
+        logger.warning("首选做法是改用证书有效的域名（见本文件 BASE_URL 处注释）。")
+        logger.warning("确认要继续可设 ALLOW_INSECURE_SSL=1 消除此提示。")
+        logger.warning("=" * 60)
