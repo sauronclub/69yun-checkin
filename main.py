@@ -2,8 +2,9 @@
 
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
+import config
 from src.checkin import run_checkin
 from src.feishu import notify_checkin_result
 
@@ -16,9 +17,10 @@ def main() -> int:
     )
     logger = logging.getLogger(__name__)
 
+    tz = timezone(timedelta(hours=config.TZ_OFFSET_HOURS))
     logger.info("=" * 50)
     logger.info("69云签到任务启动")
-    logger.info(f"当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"当前时间：{datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')} (UTC+{config.TZ_OFFSET_HOURS})")
     logger.info("=" * 50)
 
     result = run_checkin()
