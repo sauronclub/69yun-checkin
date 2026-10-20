@@ -68,9 +68,23 @@ export YUN_PASSWORD="your-password"
 python main.py
 ```
 
-可用环境变量：`REQUEST_TIMEOUT`、`REQUEST_RETRY`、`VERIFY_SSL`、`USER_AGENT`。
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `REQUEST_TIMEOUT` | `30` | 单次请求超时（秒） |
+| `REQUEST_RETRY` | `3` | 最大尝试次数 |
+| `RETRY_BACKOFF` | `5` | 重试退避基数（秒），指数增长 |
+| `TZ_OFFSET_HOURS` | `8` | 日志/通知的时区偏移，默认北京时间 |
+| `USER_AGENT` | Chrome UA | 请求使用的 UA |
+| `VERIFY_SSL` | `true` | 是否校验 TLS 证书，**不建议关** |
+| `ALLOW_INSECURE_SSL` | 未设置 | 设为 `1` 时不再提示「已关闭证书校验」 |
 
 ## 常见问题
+
+**收到「已签到」但其实没签到成功？**
+
+不会。`ret=0` 是面板的通用失败码，「今日已签到」只是其中一种。
+脚本会检查提示文案，只有明确包含「已签到/签到过」才判定为成功；
+套餐过期、账号被封、流量用完等一律按失败处理并返回非零退出码。
 
 **提示「账号开启了两步验证」**
 面板给账号开了 2FA，接口登录会被拒。需先在面板关闭 2FA；这类场景确实无法用无状态接口自动完成。
